@@ -1,0 +1,7 @@
+
+int lseek(int fd, int off)
+
+fd, the file descriptor the file
+off, the off of the file that you want to set
+return 0 upon succeed
+return -1 upon failure

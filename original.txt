@@ -1,0 +1,230 @@
+
+--- ../xv6-orin/fcntl.h	2017-11-07 21:24:44.000000000 -0600
++++ ./xv6/fcntl.h	2017-11-21 15:41:05.000000000 -0600
+@@ -2,3 +2,4 @@
+ #define O_WRONLY  0x001
+ #define O_RDWR    0x002
+ #define O_CREATE  0x200
++#define O_EXTENT  0x010
+--- ../xv6-orin/stat.h	2017-11-07 21:24:45.000000000 -0600
++++ ./xv6/stat.h	2017-11-25 12:00:37.000000000 -0600
+@@ -1,11 +1,13 @@
+ #define T_DIR  1   // Directory
+ #define T_FILE 2   // File
+ #define T_DEV  3   // Device
+-
++#define T_FILE_EXTENT 4   // EXTENT TYPE File 
+ struct stat {
+   short type;  // Type of file
+   int dev;     // File system's disk device
+   uint ino;    // Inode number
+   short nlink; // Number of links to file
+   uint size;   // Size of file in bytes
++  uint start[13];// start of extent blocks
++  uint length[13];// length of extent blocks
+ };
+--- ../xv6-orin/fs.h	2017-11-07 21:24:44.000000000 -0600
++++ ./xv6/fs.h	2017-11-22 10:20:37.000000000 -0600
+@@ -23,6 +23,7 @@
+ 
+ #define NDIRECT 12
+ #define NINDIRECT (BSIZE / sizeof(uint))
++#define NEXTENT 256
+ #define MAXFILE (NDIRECT + NINDIRECT)
+ 
+ // On-disk inode structure
+--- ../xv6-orin/fs.c	2017-11-07 21:24:44.000000000 -0600
++++ ./xv6/fs.c	2017-11-28 21:07:16.000000000 -0600
+@@ -77,6 +77,7 @@
+   panic("balloc: out of blocks");
+ }
+ 
++
+ // Free a disk block.
+ static void
+ bfree(int dev, uint b)
+@@ -370,11 +371,70 @@
+ 
+ // Return the disk block address of the nth block in inode ip.
+ // If there is no such block, bmap allocates one.
++
+ static uint
+-bmap(struct inode *ip, uint bn)
++bmap(struct inode *ip, uint b)
+ {
+-  uint addr, *a;
++  uint addr, *a,start=0,length=0,m,next;
++  int bn=(int) b;
+   struct buf *bp;
++	if((ip->type==T_FILE_EXTENT) && bn<NEXTENT*13){
++
++			
++		if(ip->addrs[0]==0) {
++			start= balloc(ip->dev);
++			length=1;
++			ip->addrs[0]=addr=(start<<8)|length;
++			cprintf("bmap reach addrs[0]==0 return %p \n",start);
++			return start;
++		}else{				
++			cprintf("bmap reach addrs[0]!=0 \n");
++			
++			int cadrr=0;
++			while((addr=ip->addrs[cadrr])!=0&&cadrr<13){
++										
++			start=(uint) (addr >> 8);
++			length=(uint) (addr & 0xFF);
++			if((bn=bn-((int) length))<0){
++			cprintf("bmap reach found existing bn block, return bn block address %p \n",start+(bn+length));
++			return start+(bn+length);
++			}
++			cadrr++;
++		}
++							
++		if(bn!=0)   panic("bmap: allocate more than one block \n");
++
++
++		bp = bread(ip->dev, BBLOCK(start, sb));
++		next=start+length;
++							
++		m = 1 << (next % 8);
++		if(((bp->data[next/8] & m) != 0)|(length==16)){
++			brelse(bp);
++			start= balloc(ip->dev);
++			length=1;
++			ip->addrs[cadrr]=addr=(start<<8)|length;
++			cprintf("bmap reach next block not available, return new block address %p ip->addrs[%p]=%p\n",start,cadrr,addr);
++
++
++			return start;
++		}else{  // block free
++		bp->data[next/8] |= m;  // Mark block in use.
++		log_write(bp);
++		brelse(bp);
++		bzero(ip->dev, next);
++		length++;
++
++		ip->addrs[cadrr-1]=addr=(start<<8)|length;
++		cprintf("bmap reach next block available, return next block address %p ip->addrs[%p]=%p\n",start+length-1,cadrr-1,addr);
++		return start+length-1;
++								
++		}
++	}
++			
++
++	}
++	
+ 
+   if(bn < NDIRECT){
+     if((addr = ip->addrs[bn]) == 0)
+@@ -400,6 +460,7 @@
+   panic("bmap: out of range");
+ }
+ 
++
+ // Truncate inode (discard contents).
+ // Only called when the inode has no links
+ // to it (no directory entries referring to it)
+@@ -445,6 +506,12 @@
+   st->type = ip->type;
+   st->nlink = ip->nlink;
+   st->size = ip->size;
++	uint addr;
++	for(int i=0;i<13;i++){
++			addr=ip->addrs[i];
++			st->start[i]=(uint) ((addr >> 8) & 0xFFFFFF);
++			st->length[i]=(uint) (addr & 0xFF);
++	}
+ }
+ 
+ //PAGEBREAK!
+@@ -669,3 +736,4 @@
+ {
+   return namex(path, 1, name);
+ }
++
+--- ../xv6-orin/user.h	2017-11-07 21:24:45.000000000 -0600
++++ ./xv6/user.h	2017-11-28 20:04:25.000000000 -0600
+@@ -23,6 +23,7 @@
+ char* sbrk(int);
+ int sleep(int);
+ int uptime(void);
++int lseek(int,int);
+ 
+ // ulib.c
+ int stat(char*, struct stat*);
+--- ../xv6-orin/usys.S	2017-11-07 21:24:45.000000000 -0600
++++ ./xv6/usys.S	2017-11-28 18:36:57.000000000 -0600
+@@ -29,3 +29,4 @@
+ SYSCALL(sbrk)
+ SYSCALL(sleep)
+ SYSCALL(uptime)
++SYSCALL(lseek)
+--- ../xv6-orin/syscall.h	2017-11-07 21:24:45.000000000 -0600
++++ ./xv6/syscall.h	2017-11-28 19:28:39.000000000 -0600
+@@ -20,3 +20,4 @@
+ #define SYS_link   19
+ #define SYS_mkdir  20
+ #define SYS_close  21
++#define SYS_lseek  22
+--- ../xv6-orin/syscall.c	2017-11-07 21:24:45.000000000 -0600
++++ ./xv6/syscall.c	2017-11-28 18:43:02.000000000 -0600
+@@ -103,6 +103,7 @@
+ extern int sys_wait(void);
+ extern int sys_write(void);
+ extern int sys_uptime(void);
++extern int sys_lseek(void);
+ 
+ static int (*syscalls[])(void) = {
+ [SYS_fork]    sys_fork,
+@@ -126,6 +127,7 @@
+ [SYS_link]    sys_link,
+ [SYS_mkdir]   sys_mkdir,
+ [SYS_close]   sys_close,
++[SYS_lseek]   sys_lseek,
+ };
+ 
+ void
+--- ../xv6-orin/sysfile.c	2017-11-07 21:24:45.000000000 -0600
++++ ./xv6/sysfile.c	2017-11-28 19:53:12.000000000 -0600
+@@ -252,7 +252,7 @@
+   if((ip = dirlookup(dp, name, &off)) != 0){
+     iunlockput(dp);
+     ilock(ip);
+-    if(type == T_FILE && ip->type == T_FILE)
++    if((type == ip->type)&&((type == T_FILE)||(type == T_FILE_EXTENT)))
+       return ip;
+     iunlockput(ip);
+     return 0;
+@@ -297,7 +297,12 @@
+   begin_op();
+ 
+   if(omode & O_CREATE){
++	if(omode&O_EXTENT){
++		ip = create(path, T_FILE_EXTENT, 0, 0);
++	}else{
+     ip = create(path, T_FILE, 0, 0);
++	}
++    
+     if(ip == 0){
+       end_op();
+       return -1;
+@@ -443,3 +448,19 @@
+   fd[1] = fd1;
+   return 0;
+ }
++
++int sys_lseek(void){
++		int fd,offset;
++		struct file *f;
++		  if(argfd(0, &fd, &f) < 0 )
++   				 return -1;
++   		if(argint(1, &offset) < 0)
++    				return -1;
++    	if(offset>f->ip->size)
++    				return -1;
++
++    	f->off=offset;
++			cprintf("f->off has been changed to %d \n",f->off);
++    	return 0;			
++    				
++}
